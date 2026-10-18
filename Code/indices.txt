@@ -1,0 +1,63 @@
+!pip install rdkit pandas openpyxl
+
+import pandas as pd
+import numpy as np
+from rdkit import Chem
+from rdkit.Chem import GetDistanceMatrix
+from google.colab import files
+import io
+
+print("Please upload your completed Excel file (alz.xlsx):")
+uploaded = files.upload()
+file_name = list(uploaded.keys())[0]
+df = pd.read_excel(io.BytesIO(uploaded[file_name]))
+
+results = []
+
+for index, row in df.iterrows():
+    smiles = row['SMILES Code']
+    compound_name = row['Compound Name']
+    mol = Chem.MolFromSmiles(str(smiles))
+    
+    if mol is not None:
+        dist_matrix = GetDistanceMatrix(mol)
+        ecc = dist_matrix.max(axis=1)
+        
+        M1_ecc = 0
+        M2_ecc = 0
+        H_ecc = 0
+        R_ecc = 0
+        GA_ecc = 0
+        ABC_ecc = 0
+        
+        for bond in mol.GetBonds():
+            u = bond.GetBeginAtomIdx()
+            v = bond.GetEndAtomIdx()
+            eu = ecc[u]
+            ev = ecc[v]
+            
+            M1_ecc += (eu + ev)
+            M2_ecc += (eu * ev)
+            H_ecc += 2 / (eu + ev)
+            R_ecc += 1 / np.sqrt(eu * ev)
+            GA_ecc += 2 * np.sqrt(eu * ev) / (eu + ev)
+            ABC_ecc += np.sqrt((eu + ev - 2) / (eu * ev))
+            
+        row_data = row.to_dict()
+        row_data['Eccentric M1'] = M1_ecc
+        row_data['Eccentric M2'] = M2_ecc
+        row_data['Eccentric Harmonic'] = H_ecc
+        row_data['Eccentric Randic'] = R_ecc
+        row_data['Eccentric GA'] = GA_ecc
+        row_data['Eccentric ABC'] = ABC_ecc
+        
+        results.append(row_data)
+    else:
+        print(f"Error processing {compound_name}")
+
+final_df = pd.DataFrame(results)
+output_filename = "Master_Dataset_with_Indices.xlsx"
+final_df.to_excel(output_filename, index=False)
+
+print("Calculation complete! Downloading your master dataset...")
+files.download(output_filename)

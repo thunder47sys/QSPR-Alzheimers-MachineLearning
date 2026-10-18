@@ -1,0 +1,249 @@
+!pip install xgboost pandas scikit-learn openpyxl scipy
+
+import pandas as pd
+import numpy as np
+import io
+import itertools
+import xgboost as xgb
+from google.colab import files
+from scipy.stats import shapiro
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.model_selection import LeaveOneOut, KFold, GridSearchCV, cross_val_predict
+from sklearn.neural_network import MLPRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVR
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+import warnings
+
+warnings.filterwarnings('ignore')
+
+print("Please upload your Dataset (Master_Dataset_with_Indices.xlsx):")
+uploaded = files.upload()
+file_name = list(uploaded.keys())[0]
+df = pd.read_excel(io.BytesIO(uploaded[file_name]))
+
+feature_cols = ['Eccentric M1', 'Eccentric M2', 'Eccentric Harmonic', 
+                'Eccentric Randic', 'Eccentric GA', 'Eccentric ABC']
+short_names = ['M1*', 'M2*', 'H*', 'R*', 'GA*', 'ABC*']
+X = df[feature_cols].values
+
+properties = [
+    'LogP (XLogP)', 'TPSA', 'Molecular Weight g/mol', 'Exact Mass', 
+    'H-Bond Donors (HBD)', 'H-Bond Acceptors (HBA)', 'Complexity', 
+    'Boiling Point', 'Density g/cm³', 'Flash Point', 
+    'Molar refractivity cm³', 'Polarizability cm³', 
+    'Surface tension dyne/cm', 'Molar volume cm³'
+]
+
+# Custom Transformer to ensure Fuzzification happens strictly inside each CV training fold (No Data Leakage)
+class GaussianFuzzifier(BaseEstimator, TransformerMixin):
+    def __init__(self):
+        pass
+    def fit(self, X, y=None):
+        self.c_low_ = np.min(X, axis=0)
+        self.c_med_ = np.mean(X, axis=0)
+        self.c_high_ = np.max(X, axis=0)
+        self.sigma_ = 0.5 * (self.c_high_ - self.c_low_)
+        self.sigma_[self.sigma_ == 0] = 1e-9
+        return self
+    def transform(self, X):
+        fuzzified_features = []
+        for i in range(X.shape[1]):
+            col = X[:, i]
+            mu_low = np.exp(-((col - self.c_low_[i])**2) / (2 * self.sigma_[i]**2))
+            mu_med = np.exp(-((col - self.c_med_[i])**2) / (2 * self.sigma_[i]**2))
+            mu_high = np.exp(-((col - self.c_high_[i])**2) / (2 * self.sigma_[i]**2))
+            fuzzified_features.extend([mu_low, mu_med, mu_high])
+        return np.column_stack(fuzzified_features)
+
+# Build Leak-Free Pipelines wrapped in TransformedTargetRegressor
+def get_model_searches():
+    # 1. XGBoost
+    xgb_pipe = Pipeline([('scaler', StandardScaler()), ('model', xgb.XGBRegressor(objective='reg:squarederror', random_state=42))])
+    xgb_ttr = TransformedTargetRegressor(regressor=xgb_pipe, transformer=StandardScaler())
+    xgb_grid = {'regressor__model__n_estimators': [50, 100], 'regressor__model__max_depth': [2, 3], 'regressor__model__learning_rate': [0.1]}
+    
+    # 2. Random Forest
+    rf_pipe = Pipeline([('scaler', StandardScaler()), ('model', RandomForestRegressor(random_state=42))])
+    rf_ttr = TransformedTargetRegressor(regressor=rf_pipe, transformer=StandardScaler())
+    rf_grid = {'regressor__model__n_estimators': [50, 100], 'regressor__model__max_depth': [3, 5]}
+    
+    # 3. Gradient Boosting
+    gbr_pipe = Pipeline([('scaler', StandardScaler()), ('model', GradientBoostingRegressor(random_state=42))])
+    gbr_ttr = TransformedTargetRegressor(regressor=gbr_pipe, transformer=StandardScaler())
+    gbr_grid = {'regressor__model__n_estimators': [50, 100], 'regressor__model__max_depth': [3]}
+    
+    # 4. SVR
+    svr_pipe = Pipeline([('scaler', StandardScaler()), ('model', SVR())])
+    svr_ttr = TransformedTargetRegressor(regressor=svr_pipe, transformer=StandardScaler())
+    svr_grid = {'regressor__model__C': [1, 10], 'regressor__model__kernel': ['rbf']}
+    
+    # 5. FANN (Scaler -> Fuzzifier -> PCA -> MLP)
+    fann_pipe = Pipeline([
+        ('scaler', StandardScaler()),
+        ('fuzz', GaussianFuzzifier()),
+        ('pca', PCA(n_components=4, random_state=42)),
+        ('model', MLPRegressor(max_iter=2000, random_state=42, solver='lbfgs', alpha=1.5))
+    ])
+    fann_ttr = TransformedTargetRegressor(regressor=fann_pipe, transformer=StandardScaler())
+    fann_grid = {'regressor__model__hidden_layer_sizes': [(8,), (12,)]}
+    
+    # 6. PCA-MLP without Fuzzification (Reviewer 3 Point 6 Ablation Benchmark)
+    pcamlp_pipe = Pipeline([
+        ('scaler', StandardScaler()),
+        ('pca', PCA(n_components=4, random_state=42)),
+        ('model', MLPRegressor(max_iter=2000, random_state=42, solver='lbfgs', alpha=1.5))
+    ])
+    pcamlp_ttr = TransformedTargetRegressor(regressor=pcamlp_pipe, transformer=StandardScaler())
+    pcamlp_grid = {'regressor__model__hidden_layer_sizes': [(8,), (12,)]}
+
+    # 7. Multiple Linear Regression (Reviewer 2 Point 1 Baseline)
+    mlr_pipe = Pipeline([('scaler', StandardScaler()), ('model', LinearRegression())])
+    mlr_ttr = TransformedTargetRegressor(regressor=mlr_pipe, transformer=StandardScaler())
+    mlr_grid = {}
+
+    return {
+        'XGBoost': GridSearchCV(xgb_ttr, xgb_grid, cv=3, scoring='neg_mean_squared_error'),
+        'Random Forest': GridSearchCV(rf_ttr, rf_grid, cv=3, scoring='neg_mean_squared_error'),
+        'Gradient Boosting': GridSearchCV(gbr_ttr, gbr_grid, cv=3, scoring='neg_mean_squared_error'),
+        'SVR': GridSearchCV(svr_ttr, svr_grid, cv=3, scoring='neg_mean_squared_error'),
+        'FANN': GridSearchCV(fann_ttr, fann_grid, cv=3, scoring='neg_mean_squared_error'),
+        'PCA-MLP (No Fuzzy)': GridSearchCV(pcamlp_ttr, pcamlp_grid, cv=3, scoring='neg_mean_squared_error'),
+        'MLR': GridSearchCV(mlr_ttr, mlr_grid, cv=3, scoring='neg_mean_squared_error')
+    }
+
+loo = LeaveOneOut()
+kfold5 = KFold(n_splits=5, shuffle=True, random_state=42)
+models_list = ['XGBoost', 'Random Forest', 'Gradient Boosting', 'SVR', 'FANN', 'PCA-MLP (No Fuzzy)', 'MLR']
+
+metrics_rows = []
+predictions_data = []
+subset_rows = []
+
+print("\nStarting leak-free nested evaluation across all 14 properties...\n")
+
+for prop in properties:
+    print(f"Processing property: {prop}...")
+    y = df[prop].values
+    
+    actuals = []
+    preds_dict = {m: [] for m in models_list}
+    train_r2_folds = {m: [] for m in models_list}
+    
+    # Outer Loop: Leave-One-Out Cross-Validation (LOOCV)
+    for train_index, test_index in loo.split(X):
+        X_train, X_test = X[train_index], X[test_index]
+        y_train, y_test = y[train_index], y[test_index]
+        
+        searches = get_model_searches()
+        for m in models_list:
+            gs = searches[m]
+            gs.fit(X_train, y_train)
+            
+            # Predict on unseen test compound
+            pred_test = gs.predict(X_test)[0]
+            preds_dict[m].append(pred_test)
+            
+            # Record Training R2 on the outer training fold
+            pred_train = gs.predict(X_train)
+            train_r2_folds[m].append(r2_score(y_train, pred_train))
+            
+        actuals.append(y_test[0])
+        
+    # Leave-Many-Out (5-Fold CV) for Q2_LMO (Reviewer 2 Point 6)
+    lmo_preds_dict = {m: np.zeros_like(y, dtype=float) for m in models_list}
+    for train_idx, test_idx in kfold5.split(X):
+        X_tr, X_te = X[train_idx], X[test_idx]
+        y_tr, y_te = y[train_idx], y[test_idx]
+        searches_lmo = get_model_searches()
+        for m in models_list:
+            gs_lmo = searches_lmo[m]
+            gs_lmo.fit(X_tr, y_tr)
+            lmo_preds_dict[m][test_idx] = gs_lmo.predict(X_te)
+
+    # Store individual compound predictions and residuals
+    for i in range(len(actuals)):
+        pred_row = {
+            'Property': prop,
+            'Compound Index': i + 1,
+            'Compound Name': df['Compound Name'].iloc[i],
+            'Actual Value': actuals[i]
+        }
+        for m in models_list:
+            pred_row[f'{m} Predicted'] = preds_dict[m][i]
+            pred_row[f'{m} Residual'] = actuals[i] - preds_dict[m][i]
+        predictions_data.append(pred_row)
+
+    # Compute summary metrics for each model
+    for m in models_list:
+        r2_train_mean = np.mean(train_r2_folds[m])
+        q2_loo = r2_score(actuals, preds_dict[m])
+        q2_lmo = r2_score(y, lmo_preds_dict[m])
+        mae = mean_absolute_error(actuals, preds_dict[m])
+        mse = mean_squared_error(actuals, preds_dict[m])
+        rmse = np.sqrt(mse)
+        residuals = np.array(actuals) - np.array(preds_dict[m])
+        _, shapiro_p = shapiro(residuals)
+        
+        metrics_rows.append({
+            'Property': prop,
+            'Model': m,
+            'R2_Train': round(r2_train_mean, 4),
+            'Q2_LOO': round(q2_loo, 4),
+            'R2_minus_Q2LOO': round(r2_train_mean - q2_loo, 4),
+            'Q2_LMO_5Fold': round(q2_lmo, 4),
+            'MAE': round(mae, 4),
+            'MSE': round(mse, 4),
+            'RMSE': round(rmse, 4),
+            'Shapiro_p': round(shapiro_p, 4)
+        })
+        
+    # Exhaustive 1-to-6 Descriptor Subset MLR Analysis (Reviewer 2 Point 12 Breaking-Point)
+    for k in range(1, 7):
+        best_q2 = -1e9
+        best_r2 = -1e9
+        best_combo = None
+        for combo in itertools.combinations(range(6), k):
+            X_sub = X[:, combo]
+            lr = LinearRegression().fit(X_sub, y)
+            r2_tr = r2_score(y, lr.predict(X_sub))
+            preds_sub_loo = cross_val_predict(LinearRegression(), X_sub, y, cv=loo)
+            q2_sub_loo = r2_score(y, preds_sub_loo)
+            if q2_sub_loo > best_q2:
+                best_q2 = q2_sub_loo
+                best_r2 = r2_tr
+                best_combo = " + ".join([short_names[idx] for idx in combo])
+        subset_rows.append({
+            'Property': prop,
+            'Num_Descriptors_k': k,
+            'Best_Subset': best_combo,
+            'MLR_R2_Train': round(best_r2, 4),
+            'MLR_Q2_LOO': round(best_q2, 4)
+        })
+
+print("\n--- Computations Complete. Saving to Excel... ---")
+
+metrics_df = pd.DataFrame(metrics_rows)
+metrics_df = metrics_df.sort_values(by=['Property', 'Q2_LOO'], ascending=[True, False])
+metrics_df['Property_Display'] = metrics_df['Property']
+metrics_df.loc[metrics_df.duplicated('Property'), 'Property_Display'] = ''
+
+final_metrics_table = metrics_df[['Property_Display', 'Model', 'R2_Train', 'Q2_LOO', 'R2_minus_Q2LOO', 'Q2_LMO_5Fold', 'MAE', 'MSE', 'RMSE', 'Shapiro_p']]
+final_metrics_table.columns = ['Property', 'Model', 'R2_Train', 'Q2_LOO', 'R2 - Q2_LOO', 'Q2_LMO (5-Fold)', 'MAE', 'MSE', 'RMSE', 'Residual Shapiro p']
+
+preds_df = pd.DataFrame(predictions_data)
+subsets_df = pd.DataFrame(subset_rows)
+
+excel_filename = 'LeakFree_Ultimate_QSPR_Results.xlsx'
+with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+    final_metrics_table.to_excel(writer, sheet_name='Formatted_Metrics', index=False)
+    preds_df.to_excel(writer, sheet_name='Predicted_Values', index=False)
+    subsets_df.to_excel(writer, sheet_name='MLR_Breaking_Point', index=False)
+
+print(f"\nSuccessfully generated '{excel_filename}'. Downloading now...")
+files.download(excel_filename)

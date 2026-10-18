@@ -1,0 +1,139 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import zipfile
+import os
+import io
+from google.colab import files
+
+sns.set_style("whitegrid")
+
+print("Please upload your QSPR_Results.xlsx file:")
+uploaded = files.upload()
+file_name = list(uploaded.keys())[0]
+
+df_metrics = pd.read_excel(io.BytesIO(uploaded[file_name]), sheet_name='Formatted_Metrics')
+df_preds = pd.read_excel(io.BytesIO(uploaded[file_name]), sheet_name='Predicted_Values')
+df_mlr = pd.read_excel(io.BytesIO(uploaded[file_name]), sheet_name='MLR_Breaking_Point')
+
+df_metrics['Property_Full'] = df_metrics['Property'].ffill()
+core_5_models = ['FANN', 'Random Forest', 'XGBoost', 'Gradient Boosting', 'SVR']
+df_core5 = df_metrics[df_metrics['Model'].isin(core_5_models)].copy()
+
+os.makedirs("figures_out", exist_ok=True)
+generated_pngs = []
+
+# 1. Generate Breaking-Point Plot (Reviewer 2 Point 12)
+selected_bp_props = [
+    'Molecular Weight g/mol', 'Exact Mass', 'Molar refractivity cm³',
+    'Polarizability cm³', 'Molar volume cm³', 'Complexity',
+    'Boiling Point', 'Flash Point', 'H-Bond Acceptors (HBA)'
+]
+
+fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+axes = axes.flatten()
+
+for idx, prop in enumerate(selected_bp_props):
+    ax = axes[idx]
+    sub = df_mlr[df_mlr['Property'] == prop].sort_values('Num_Descriptors_k')
+    k_vals = sub['Num_Descriptors_k'].values
+    r2_vals = sub['MLR_R2_Train'].values
+    q2_vals = sub['MLR_Q2_LOO'].values
+    
+    best_idx = np.argmax(q2_vals)
+    best_k, best_q2 = k_vals[best_idx], q2_vals[best_idx]
+    
+    ax.plot(k_vals, r2_vals, marker='o', linewidth=2, color='#1f77b4', label=r'$R^2_{\mathrm{Train}}$ (Fit)')
+    ax.plot(k_vals, q2_vals, marker='s', linewidth=2, linestyle='--', color='#d62728', label=r'$Q^2_{\mathrm{LOO}}$ (CV)')
+    ax.axvline(best_k, color='#2ca02c', linestyle=':', alpha=0.8, label=f'Optimal k={best_k} ({best_q2:.3f})')
+    ax.scatter([best_k], [best_q2], color='#2ca02c', s=90, zorder=5)
+    
+    ax.set_title(f"{prop}", fontsize=11, fontweight='bold')
+    ax.set_xlabel("Number of Descriptors (k)", fontsize=9)
+    ax.set_ylabel("Score", fontsize=9)
+    ax.set_xticks([1, 2, 3, 4, 5, 6])
+    ax.legend(fontsize=8, loc='lower right')
+
+plt.suptitle("MLR Breaking-Point Analysis: R² vs. Q²_LOO Across Descriptor Subset Sizes (k = 1 to 6)", fontsize=14, fontweight='bold', y=0.99)
+plt.tight_layout(rect=[0, 0, 1, 0.97])
+bp_path = "figures_out/Breaking_Point_Plot.png"
+plt.savefig(bp_path, dpi=300)
+plt.close()
+generated_pngs.append(bp_path)
+
+# 2. Generate Updated 1x3 Figures (Figures 4 to 17)
+fig_order = [
+    (4, 'Boiling Point', 'Boiling_Point'),
+    (5, 'Complexity', 'Complexity'),
+    (6, 'Density g/cm³', 'Density'),
+    (7, 'Exact Mass', 'Exact_Mass'),
+    (8, 'Flash Point', 'Flash_Point'),
+    (9, 'H-Bond Acceptors (HBA)', 'HBA'),
+    (10, 'H-Bond Donors (HBD)', 'HBD'),
+    (11, 'LogP (XLogP)', 'LogP'),
+    (12, 'Molar refractivity cm³', 'Molar_Refractivity'),
+    (13, 'Molar volume cm³', 'Molar_Volume'),
+    (14, 'Molecular Weight g/mol', 'Molecular_Weight'),
+    (15, 'Polarizability cm³', 'Polarizability'),
+    (16, 'Surface tension dyne/cm', 'Surface_Tension'),
+    (17, 'TPSA', 'TPSA')
+]
+
+for fig_num, prop, safe_name in fig_order:
+    sub_m = df_core5[df_core5['Property_Full'] == prop].sort_values(by='Q2_LOO', ascending=False)
+    best_row = sub_m.iloc[0]
+    best_model = best_row['Model']
+    best_q2 = best_row['Q2_LOO']
+    best_rmse = best_row['RMSE']
+    best_shapiro = best_row['Residual Shapiro p']
+    
+    sub_p = df_preds[df_preds['Property'] == prop]
+    actual = sub_p['Actual Value'].values
+    pred = sub_p[f'{best_model} Predicted'].values
+    resid = sub_p[f'{best_model} Residual'].values
+    
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    
+    # Panel 1: R2_Train vs Q2_LOO
+    x_pos = np.arange(len(sub_m))
+    width = 0.36
+    axes[0].bar(x_pos - width/2, sub_m['R2_Train'], width, label=r'$R^2_{\mathrm{Train}}$', color='#3465a4')
+    axes[0].bar(x_pos + width/2, sub_m['Q2_LOO'], width, label=r'$Q^2_{\mathrm{LOO}}$', color='#4e9a06')
+    axes[0].axhline(0, color='black', linewidth=0.8)
+    axes[0].set_xticks(x_pos)
+    axes[0].set_xticklabels(sub_m['Model'], rotation=30, ha='right', fontsize=9)
+    axes[0].set_ylabel('Score', fontsize=10)
+    axes[0].set_title(f'Comparison: {prop}', fontsize=11, fontweight='bold')
+    axes[0].legend(loc='best', fontsize=9)
+    
+    # Panel 2: Actual vs Predicted
+    axes[1].scatter(actual, pred, color='#000080', s=45, alpha=0.85, edgecolors='white', linewidth=0.5)
+    min_val, max_val = min(np.min(actual), np.min(pred)), max(np.max(actual), np.max(pred))
+    pad = 0.05 * (max_val - min_val) if max_val != min_val else 1.0
+    axes[1].plot([min_val - pad, max_val + pad], [min_val - pad, max_val + pad], 'r--', linewidth=1.5, label='Ideal (y = x)')
+    axes[1].set_xlabel('Actual', fontsize=10)
+    axes[1].set_ylabel('Predicted (LOOCV)', fontsize=10)
+    axes[1].set_title(f'Best: {best_model} ($Q^2_{{\\mathrm{{LOO}}}}$={best_q2:.2f}, RMSE={best_rmse:.2f})', fontsize=11, fontweight='bold')
+    axes[1].legend(loc='upper left', fontsize=9)
+    
+    # Panel 3: Residuals vs Actual
+    axes[2].scatter(actual, resid, color='#660066', s=45, alpha=0.85, edgecolors='white', linewidth=0.5)
+    axes[2].axhline(0, color='black', linestyle='--', linewidth=1.2)
+    axes[2].set_xlabel('Actual', fontsize=10)
+    axes[2].set_ylabel('Residual (Actual - Predicted)', fontsize=10)
+    axes[2].set_title(f'Residuals of {best_model} (Shapiro p={best_shapiro:.2f})', fontsize=11, fontweight='bold')
+    
+    plt.tight_layout()
+    fname = f"figures_out/Figure_{fig_num}_{safe_name}.png"
+    plt.savefig(fname, dpi=300)
+    plt.close()
+    generated_pngs.append(fname)
+
+zip_filename = "All_Updated_Manuscript_Figures.zip"
+with zipfile.ZipFile(zip_filename, 'w', zipfile.ZIP_DEFLATED) as zf:
+    for png in generated_pngs:
+        zf.write(png, os.path.basename(png))
+
+print(f"Downloading {zip_filename}...")
+files.download(zip_filename)
